@@ -55,3 +55,67 @@ func (s *WinRMSuite) TestHttpNTLMViaCustomDialerRequest(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(usedCustomDialer, Equals, true)
 }
+
+func (s *WinRMSuite) TestParseUsernameAndDomainBackslash(c *C) {
+	user, domain := parseUsernameAndDomain(`MYDOMAIN\admin`)
+	c.Assert(user, Equals, "admin")
+	c.Assert(domain, Equals, "MYDOMAIN")
+}
+
+func (s *WinRMSuite) TestParseUsernameAndDomainAtSign(c *C) {
+	user, domain := parseUsernameAndDomain("admin@corp.example.com")
+	c.Assert(user, Equals, "admin")
+	c.Assert(domain, Equals, "corp.example.com")
+}
+
+func (s *WinRMSuite) TestParseUsernameAndDomainPlain(c *C) {
+	user, domain := parseUsernameAndDomain("admin")
+	c.Assert(user, Equals, "admin")
+	c.Assert(domain, Equals, "")
+}
+
+func (s *WinRMSuite) TestNewEncryptionNTLM(c *C) {
+	enc, err := NewEncryption("ntlm")
+	c.Assert(err, IsNil)
+	c.Assert(enc, NotNil)
+	c.Assert(enc.protocol, Equals, "ntlm")
+	c.Assert(enc.ntlm.useEncryption, Equals, true)
+}
+
+func (s *WinRMSuite) TestNewEncryptionUnsupportedProtocol(c *C) {
+	enc, err := NewEncryption("credssp")
+	c.Assert(err, NotNil)
+	c.Assert(enc, IsNil)
+	c.Assert(err, ErrorMatches, `encryption for protocol 'credssp' not supported`)
+}
+
+func (s *WinRMSuite) TestNewClientNTLMEncrypted(c *C) {
+	client := NewClientNTLMEncrypted()
+	c.Assert(client.useEncryption, Equals, true)
+}
+
+func (s *WinRMSuite) TestNewClientNTLMEncryptedWithDial(c *C) {
+	dial := func(network, addr string) (net.Conn, error) {
+		return nil, nil
+	}
+	client := NewClientNTLMEncryptedWithDial(dial)
+	c.Assert(client.useEncryption, Equals, true)
+	c.Assert(client.dial, NotNil)
+}
+
+func (s *WinRMSuite) TestNewClientNTLMEncryptedWithProxyFunc(c *C) {
+	proxy := http.ProxyFromEnvironment
+	client := NewClientNTLMEncryptedWithProxyFunc(proxy)
+	c.Assert(client.useEncryption, Equals, true)
+	c.Assert(client.proxyfunc, NotNil)
+}
+
+func (s *WinRMSuite) TestNTLMEncryptedViaEncryptionWrapper(c *C) {
+	// Verify that NewEncryption("ntlm") creates a transport with encryption enabled
+	enc, err := NewEncryption("ntlm")
+	c.Assert(err, IsNil)
+
+	endpoint := NewEndpoint("localhost", 5985, false, false, nil, nil, nil, 0)
+	err = enc.Transport(endpoint)
+	c.Assert(err, IsNil)
+}

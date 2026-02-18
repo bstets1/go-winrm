@@ -5,10 +5,12 @@ _Note_: if you're looking for the `winrm` command-line tool, this has been split
 This is a Go library to execute remote commands on Windows machines through
 the use of WinRM/WinRS.
 
-_Note_: this library doesn't support domain users (it doesn't support GSSAPI nor Kerberos). It's primary target is to execute remote commands on EC2 windows machines.
-
-[![Build Status](https://travis-ci.org/masterzen/winrm.svg?branch=master)](https://travis-ci.org/masterzen/winrm)
-[![Coverage Status](https://coveralls.io/repos/masterzen/winrm/badge.png)](https://coveralls.io/r/masterzen/winrm)
+This library supports:
+- **Basic authentication** for local accounts
+- **NTLM authentication** (NTLMv2) for local and domain accounts (`DOMAIN\user` or `user@domain`)
+- **NTLM with message encryption** (sealing) — works with the default Windows `AllowUnencrypted=false` setting
+- **Kerberos authentication** for domain accounts
+- **Certificate-based authentication** (x509 mutual TLS)
 
 ## Contact
 
@@ -16,12 +18,12 @@ _Note_: this library doesn't support domain users (it doesn't support GSSAPI nor
 
 
 ## Getting Started
-WinRM is available on Windows Server 2008 and up. This project natively supports basic authentication for local accounts, see the steps in the next section on how to prepare the remote Windows machine for this scenario. The authentication model is pluggable, see below for an example on using Negotiate/NTLM authentication (e.g. for connecting to vanilla Azure VMs) or Kerberos authentication (using domain accounts).
+WinRM is available on Windows Server 2008 and up. This project supports multiple authentication methods — see the sections below for how to prepare the remote Windows machine for each scenario. The authentication model is pluggable via the `TransportDecorator` parameter.
 
-_Note_: This library only supports Golang 1.7+
+_Note_: This library requires Go 1.21+
 
 ### Preparing the remote Windows machine for Basic authentication
-This project supports only basic authentication for local accounts (domain users are not supported). The remote windows system must be prepared for winrm:
+The remote windows system must be prepared for winrm:
 
 _For a PowerShell script to do what is described below in one go, check [Richard Downer's blog](http://www.frontiertown.co.uk/2011/12/overthere-control-windows-from-java/)_
 
@@ -41,9 +43,17 @@ __N.B.:__ The `MaxMemoryPerShellMB` option has no effects on some Windows 2008R2
 
 For more information on WinRM, please refer to <a href="http://msdn.microsoft.com/en-us/library/windows/desktop/aa384426(v=vs.85).aspx">the online documentation at Microsoft's DevCenter</a>.
 
-### Preparing the remote Windows machine for kerberos authentication
-This project supports domain users via kerberos authentication. The remote windows system must be prepared for winrm:
+### Preparing the remote Windows machine for NTLM authentication
 
+NTLM authentication works with the default Windows WinRM configuration. No special server-side setup is required beyond enabling WinRM:
+
+		winrm quickconfig
+		y
+		winrm set winrm/config/winrs '@{MaxMemoryPerShellMB="1024"}'
+
+When using NTLM with encryption (the default and recommended mode), you do **not** need to set `AllowUnencrypted="true"` — the SOAP messages are encrypted using the NTLM security session.
+
+### Preparing the remote Windows machine for Kerberos authentication
 On the remote host, a PowerShell prompt, using the __Run as Administrator__ option and paste in the following lines:
 
                 winrm quickconfig
@@ -66,12 +76,6 @@ make
 
 _Note_: this winrm code doesn't depend anymore on [Gokogiri](https://github.com/moovweb/gokogiri) which means it is now in pure Go.
 
-_Note_: you need go 1.5+. Please check your installation with
-
-```
-go version
-```
-
 ## Command-line usage
 
 For command-line usage check the [winrm-cli project](https://github.com/masterzen/winrm-cli)
@@ -80,157 +84,198 @@ For command-line usage check the [winrm-cli project](https://github.com/masterze
 
 **Warning the API might be subject to change.**
 
+### Basic authentication
+
 For the fast version (this doesn't allow to send input to the command) and it's using HTTP as the transport:
 
 ```go
 package main
 
 import (
-	"github.com/masterzen/winrm"
+	"context"
 	"os"
+
+	"github.com/masterzen/winrm"
 )
 
-endpoint := winrm.NewEndpoint(host, 5986, false, false, nil, nil, nil, 0)
-client, err := winrm.NewClient(endpoint, "Administrator", "secret")
+func main() {
+	endpoint := winrm.NewEndpoint("localhost", 5985, false, false, nil, nil, nil, 0)
+	client, err := winrm.NewClient(endpoint, "Administrator", "secret")
+	if err != nil {
+		panic(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client.RunWithContext(ctx, "ipconfig /all", os.Stdout, os.Stderr)
+}
+```
+
+or with stdin:
+```go
+package main
+
+import (
+	"context"
+	"os"
+
+	"github.com/masterzen/winrm"
+)
+
+func main() {
+	endpoint := winrm.NewEndpoint("localhost", 5985, false, false, nil, nil, nil, 0)
+	client, err := winrm.NewClient(endpoint, "Administrator", "secret")
+	if err != nil {
+		panic(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err = client.RunWithContextWithInput(ctx, "ipconfig", os.Stdout, os.Stderr, os.Stdin)
+	if err != nil {
+		panic(err)
+	}
+}
+```
+
+### NTLM authentication (without encryption)
+
+Use `ClientNTLM` via the `TransportDecorator`. This requires `AllowUnencrypted="true"` on the server:
+
+```go
+endpoint := winrm.NewEndpoint("localhost", 5985, false, false, nil, nil, nil, 0)
+
+params := winrm.DefaultParameters
+params.TransportDecorator = func() winrm.Transporter { return &winrm.ClientNTLM{} }
+
+client, err := winrm.NewClientWithParameters(endpoint, "Administrator", "secret", params)
 if err != nil {
 	panic(err)
 }
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
 client.RunWithContext(ctx, "ipconfig /all", os.Stdout, os.Stderr)
 ```
 
-or
-```go
-package main
-import (
-  "github.com/masterzen/winrm"
-  "fmt"
-  "os"
-)
+### NTLM authentication with encryption (recommended)
 
+Use `NewClientNTLMEncrypted()` for NTLM with message-level encryption. This works with the **default Windows configuration** (`AllowUnencrypted=false`) and is the recommended approach:
+
+```go
 endpoint := winrm.NewEndpoint("localhost", 5985, false, false, nil, nil, nil, 0)
-client, err := winrm.NewClient(endpoint,"Administrator", "secret")
-if err != nil {
-	panic(err)
-}
-
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
-_, err := client.RunWithContextWithInput(ctx, "ipconfig", os.Stdout, os.Stderr, os.Stdin)
-if err != nil {
-	panic(err)
-}
-
-```
-
-By passing a TransportDecorator in the Parameters struct it is possible to use different Transports (e.g. NTLM)
-
-```go
-package main
-import (
-  "github.com/masterzen/winrm"
-  "fmt"
-  "os"
-)
-
-endpoint := winrm.NewEndpoint("localhost", 5985, false, false, nil, nil, nil, 0)
-
-params := DefaultParameters
-params.TransportDecorator = func() Transporter { return &ClientNTLM{} }
-
-client, err := NewClientWithParameters(endpoint, "test", "test", params)
-if err != nil {
-	panic(err)
-}
-
-_, err := client.RunWithInput("ipconfig", os.Stdout, os.Stderr, os.Stdin)
-if err != nil {
-	panic(err)
-}
-
-```
-
-Passing a TransportDecorator also permit to use Kerberos authentication
-
-```go
-package main
-import (
-  "os"
-  "fmt"
-  "github.com/masterzen/winrm"
-)
-
-endpoint := winrm.NewEndpoint("srv-win", 5985, false, false, nil, nil, nil, 0)
 
 params := winrm.DefaultParameters
-params.TransportDecorator = func() Transporter {
-        return &winrm.ClientKerberos{
-		Username: "test",
-		Password: "s3cr3t",
-		Hostname: "srv-win",
-		Realm: "DOMAIN.LAN",
-		Port: 5985,
-		Proto: "http",
-		KrbConf: "/etc/krb5.conf",
-		SPN: fmt.Sprintf("HTTP/%s", hostname),
-	}
-}
+params.TransportDecorator = func() winrm.Transporter { return winrm.NewClientNTLMEncrypted() }
 
-client, err := NewClientWithParameters(endpoint, "test", "s3cr3t", params)
+client, err := winrm.NewClientWithParameters(endpoint, "Administrator", "secret", params)
 if err != nil {
-        panic(err)
+	panic(err)
 }
-
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
-_, err := client.RunWithContextWithInput(ctx, "ipconfig", os.Stdout, os.Stderr, os.Stdin)
-if err != nil {
-        panic(err)
-}
-
+client.RunWithContext(ctx, "ipconfig /all", os.Stdout, os.Stderr)
 ```
 
+Domain users are supported via `DOMAIN\user` or `user@domain` formats:
 
-By passing a Dial in the Parameters struct it is possible to use different dialer (e.g. tunnel through SSH)
+```go
+client, err := winrm.NewClientWithParameters(endpoint, `MYDOMAIN\admin`, "secret", params)
+// or
+client, err := winrm.NewClientWithParameters(endpoint, "admin@mydomain.com", "secret", params)
+```
+
+The `NewEncryption("ntlm")` API is also available for backwards compatibility:
+
+```go
+params.TransportDecorator = func() winrm.Transporter {
+	enc, _ := winrm.NewEncryption("ntlm")
+	return enc
+}
+```
+
+### Kerberos authentication
 
 ```go
 package main
-     
- import (
-    "github.com/masterzen/winrm"
-    "golang.org/x/crypto/ssh"
-    "os"
- )
- 
- func main() {
- 
-    sshClient, err := ssh.Dial("tcp","localhost:22", &ssh.ClientConfig{
-        User:"ubuntu",
-        Auth: []ssh.AuthMethod{ssh.Password("ubuntu")},
-        HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-    })
- 
-    endpoint := winrm.NewEndpoint("other-host", 5985, false, false, nil, nil, nil, 0)
- 
-    params := winrm.DefaultParameters
-    params.Dial = sshClient.Dial
- 
-    client, err := winrm.NewClientWithParameters(endpoint, "test", "test", params)
-    if err != nil {
-        panic(err)
-    }
- 
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-    _, err = client.RunWithContextWithInput(ctx, "ipconfig", os.Stdout, os.Stderr, os.Stdin)
-    if err != nil {
-        panic(err)
-    }
- }
 
+import (
+	"context"
+	"fmt"
+	"os"
+
+	"github.com/masterzen/winrm"
+)
+
+func main() {
+	endpoint := winrm.NewEndpoint("srv-win", 5985, false, false, nil, nil, nil, 0)
+
+	params := winrm.DefaultParameters
+	params.TransportDecorator = func() winrm.Transporter {
+		return &winrm.ClientKerberos{
+			Username: "test",
+			Password: "s3cr3t",
+			Hostname: "srv-win",
+			Realm:    "DOMAIN.LAN",
+			Port:     5985,
+			Proto:    "http",
+			KrbConf:  "/etc/krb5.conf",
+			SPN:      fmt.Sprintf("HTTP/%s", "srv-win"),
+		}
+	}
+
+	client, err := winrm.NewClientWithParameters(endpoint, "test", "s3cr3t", params)
+	if err != nil {
+		panic(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err = client.RunWithContextWithInput(ctx, "ipconfig", os.Stdout, os.Stderr, os.Stdin)
+	if err != nil {
+		panic(err)
+	}
+}
 ```
 
+### Custom dialer (e.g. tunnel through SSH)
+
+```go
+package main
+
+import (
+	"context"
+	"os"
+
+	"github.com/masterzen/winrm"
+	"golang.org/x/crypto/ssh"
+)
+
+func main() {
+	sshClient, err := ssh.Dial("tcp", "localhost:22", &ssh.ClientConfig{
+		User:            "ubuntu",
+		Auth:            []ssh.AuthMethod{ssh.Password("ubuntu")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	endpoint := winrm.NewEndpoint("other-host", 5985, false, false, nil, nil, nil, 0)
+
+	params := winrm.DefaultParameters
+	params.Dial = sshClient.Dial
+
+	client, err := winrm.NewClientWithParameters(endpoint, "test", "test", params)
+	if err != nil {
+		panic(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err = client.RunWithContextWithInput(ctx, "ipconfig", os.Stdout, os.Stderr, os.Stdin)
+	if err != nil {
+		panic(err)
+	}
+}
+```
+
+
+### Shell API (advanced)
 
 For a more complex example, it is possible to call the various functions directly:
 
@@ -238,84 +283,90 @@ For a more complex example, it is possible to call the various functions directl
 package main
 
 import (
-  "github.com/masterzen/winrm"
-  "fmt"
-  "bytes"
-  "os"
+	"bytes"
+	"io"
+	"os"
+
+	"github.com/masterzen/winrm"
 )
 
-stdin := bytes.NewBufferString("ipconfig /all")
-endpoint := winrm.NewEndpoint("localhost", 5985, false, false,nil, nil, nil, 0)
-client , err := winrm.NewClient(endpoint, "Administrator", "secret")
-if err != nil {
-	panic(err)
-}
-shell, err := client.CreateShell()
-if err != nil {
-  panic(err)
-}
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
-var cmd *winrm.Command
-cmd, err = shell.ExecuteWithContext(ctx, "cmd.exe")
-if err != nil {
-  panic(err)
-}
+func main() {
+	stdin := bytes.NewBufferString("ipconfig /all")
+	endpoint := winrm.NewEndpoint("localhost", 5985, false, false, nil, nil, nil, 0)
+	client, err := winrm.NewClient(endpoint, "Administrator", "secret")
+	if err != nil {
+		panic(err)
+	}
+	shell, err := client.CreateShell()
+	if err != nil {
+		panic(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var cmd *winrm.Command
+	cmd, err = shell.ExecuteWithContext(ctx, "cmd.exe")
+	if err != nil {
+		panic(err)
+	}
 
-go io.Copy(cmd.Stdin, stdin)
-go io.Copy(os.Stdout, cmd.Stdout)
-go io.Copy(os.Stderr, cmd.Stderr)
+	go io.Copy(cmd.Stdin, stdin)
+	go io.Copy(os.Stdout, cmd.Stdout)
+	go io.Copy(os.Stderr, cmd.Stderr)
 
-cmd.Wait()
-shell.Close()
+	cmd.Wait()
+	shell.Close()
+}
 ```
 
-For using HTTPS authentication with x 509 cert without checking the CA
+### HTTPS with certificate authentication
+
 ```go
 package main
 
 import (
-    "github.com/masterzen/winrm"
-    "log"
-    "os"
+	"context"
+	"log"
+	"os"
+
+	"github.com/masterzen/winrm"
 )
 
 func main() {
-    clientCert, err := os.ReadFile("/home/example/winrm_client_cert.pem")
-    if err != nil {
-        log.Fatalf("failed to read client certificate: %q", err)
-    }
+	clientCert, err := os.ReadFile("/home/example/winrm_client_cert.pem")
+	if err != nil {
+		log.Fatalf("failed to read client certificate: %q", err)
+	}
 
-    clientKey, err := os.ReadFile("/home/example/winrm_client_key.pem")
-    if err != nil {
-        log.Fatalf("failed to read client key: %q", err)
-    }
+	clientKey, err := os.ReadFile("/home/example/winrm_client_key.pem")
+	if err != nil {
+		log.Fatalf("failed to read client key: %q", err)
+	}
 
-    winrm.DefaultParameters.TransportDecorator = func() winrm.Transporter {
-        // winrm https module
-        return &winrm.ClientAuthRequest{}
-    }
+	winrm.DefaultParameters.TransportDecorator = func() winrm.Transporter {
+		// winrm https module
+		return &winrm.ClientAuthRequest{}
+	}
 
-    endpoint := winrm.NewEndpoint(
-        "192.168.100.2", // host to connect to
-        5986,            // winrm port
-        true,            // use TLS
-        true,            // Allow insecure connection
-        nil,             // CA certificate
-        clientCert,      // Client Certificate
-        clientKey,       // Client Key
-        0,               // Timeout
-    )
-    client, err := winrm.NewClient(endpoint, "Administrator", "")
-    if err != nil {
-        log.Fatalf("failed to create client: %q", err)
-    }
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-    _, err = client.RunWithContext(ctx, "whoami", os.Stdout, os.Stderr)
-    if err != nil {
-        log.Fatalf("failed to run command: %q", err)
-    }
+	endpoint := winrm.NewEndpoint(
+		"192.168.100.2", // host to connect to
+		5986,            // winrm port
+		true,            // use TLS
+		true,            // Allow insecure connection
+		nil,             // CA certificate
+		clientCert,      // Client Certificate
+		clientKey,       // Client Key
+		0,               // Timeout
+	)
+	client, err := winrm.NewClient(endpoint, "Administrator", "")
+	if err != nil {
+		log.Fatalf("failed to create client: %q", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err = client.RunWithContext(ctx, "whoami", os.Stdout, os.Stderr)
+	if err != nil {
+		log.Fatalf("failed to run command: %q", err)
+	}
 }
 ```
 
@@ -327,15 +378,10 @@ rather cause a running command to be aborted on the remote machine via a call to
 ## Developing on WinRM
 
 If you wish to work on `winrm` itself, you'll first need [Go](http://golang.org)
-installed (version 1.5+ is _required_). Make sure you have Go properly installed,
+installed (version 1.21+ is _required_). Make sure you have Go properly installed,
 including setting up your [GOPATH](http://golang.org/doc/code.html#GOPATH).
 
-For some additional dependencies, Go needs [Mercurial](http://mercurial.selenic.com/)
-and [Bazaar](http://bazaar.canonical.com/en/) to be installed.
-Winrm itself doesn't require these, but a dependency of a dependency does.
-
-Next, clone this repository into `$GOPATH/src/github.com/masterzen/winrm` and
-then just type `make`.
+Next, clone this repository and then just type `make`.
 
 You can run tests by typing `make test`.
 
