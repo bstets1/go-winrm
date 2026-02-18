@@ -3,11 +3,16 @@ package winrm
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 
@@ -16,47 +21,75 @@ import (
 	"github.com/masterzen/winrm/soap"
 )
 
-// contentLengthFixTransport works around a bug in bodgit/ntlmssp where the
-// HTTP client's wrap() method replaces the request body with the encrypted
-// (sealed) payload but does not update req.ContentLength. This causes Go's
-// net/http transport to reject the request with:
-//
-//	"http: ContentLength=N with Body length M"
-//
-// This wrapper reads the final body, sets ContentLength to the actual size,
-// and forwards the request to the real transport.
-type contentLengthFixTransport struct {
-	base http.RoundTripper
+var wwwAuthHeader = textproto.CanonicalMIMEHeaderKey("WWW-Authenticate")
+
+// ntlmDebug prints to stderr when WINRM_DEBUG=1.
+func ntlmDebug(format string, args ...interface{}) {
+	if os.Getenv("WINRM_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "[ntlm] "+format+"\n", args...)
+	}
 }
 
-func (t *contentLengthFixTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Body != nil {
-		body, err := io.ReadAll(req.Body)
-		if err != nil {
-			return nil, err
-		}
-		req.Body = io.NopCloser(bytes.NewReader(body))
-		req.ContentLength = int64(len(body))
+// debugRoundTripper logs HTTP request/response metadata to stderr when WINRM_DEBUG=1.
+// It does NOT modify ContentLength or bodies.
+type debugRoundTripper struct {
+	base  http.RoundTripper
+	label string
+}
+
+func (d *debugRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	authLen := 0
+	if a := req.Header.Get("Authorization"); a != "" {
+		authLen = len(a)
 	}
-	return t.base.RoundTrip(req)
+	ntlmDebug("[%s] → POST %s  CT=%q  auth=%d  CL=%d",
+		d.label, req.URL.Path, req.Header.Get("Content-Type"), authLen, req.ContentLength)
+	resp, err := d.base.RoundTrip(req)
+	if err != nil {
+		ntlmDebug("[%s] ← ERROR: %v", d.label, err)
+		return nil, err
+	}
+	ntlmDebug("[%s] ← %d  CT=%q  Conn=%q",
+		d.label, resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header.Get("Connection"))
+	return resp, nil
+}
+
+// wrapDebug wraps t in a debug logger when WINRM_DEBUG=1, otherwise returns t unchanged.
+// NOTE: Do NOT use the wrapped result where a *http.Transport type-assertion is required.
+func wrapDebug(label string, t http.RoundTripper) http.RoundTripper {
+	if os.Getenv("WINRM_DEBUG") == "1" {
+		return &debugRoundTripper{base: t, label: label}
+	}
+	return t
 }
 
 // ClientNTLM provides a transport via NTLMv2 using bodgit/ntlmssp.
-// When useEncryption is true, SOAP messages are sealed (encrypted) using
-// the NTLM security session, which works with the default Windows
-// AllowUnencrypted=false setting.
+//
+//   - Plain NTLM (useEncryption==false): delegates to bodgit's ntlmhttp.Client which handles
+//     the NTLM 3-way handshake transparently. Requires AllowUnencrypted=true on the server.
+//
+//   - Encrypted NTLM (useEncryption==true): implements the MS-WSMV NTLM message-encryption
+//     protocol (application/HTTP-SPNEGO-session-encrypted) directly. Works with the default
+//     Windows AllowUnencrypted=false. The AUTHENTICATE token and sealed SOAP body are combined
+//     in a single HTTP request as required by MS-WSMV §7.2.
 type ClientNTLM struct {
 	clientRequest
 	useEncryption bool
 
-	// Cached session state — reused across Post() calls to avoid
-	// re-handshaking on every request. Protected by mu.
-	mu             sync.Mutex
-	ntlmClient     *ntlmssp.Client
+	mu sync.Mutex
+
+	// Shared state
+	ntlmClient *ntlmssp.Client
+	cachedUser string
+	cachedPass string
+
+	// Plain NTLM only — bodgit's client handles auth transparently.
 	ntlmHTTPClient *ntlmhttp.Client
-	cachedUser     string
-	cachedPass     string
-	sessionReady   bool // true after encrypted session handshake completes
+
+	// Encrypted NTLM only — we drive the wire protocol manually.
+	rawHTTP         *http.Client    // pinned-connection http.Client
+	pinnedTransport *http.Transport // underlying transport (owns conn pool)
+	sessionReady    bool
 }
 
 // Transport creates the base HTTP transport for NTLM connections.
@@ -80,15 +113,24 @@ func (c *ClientNTLM) Post(client *Client, request *soap.SoapMessage) (string, er
 	return c.postPlain(client, request)
 }
 
-// ensureSession creates or reuses the bodgit NTLM client and HTTP client.
-// If credentials changed, the session is re-created.
-// For encrypted sessions, performs the initial auth handshake if needed.
+// ensureSession creates or reuses the NTLM session.
+//
+// Encrypted path: initialises the raw http.Client. The actual NTLM 3-way
+// handshake (probe→NEGOTIATE→AUTHENTICATE) is deferred to doPostEncrypted
+// so it can be done on the correct TCP connection.
+//
+// Plain path: creates a bodgit ntlmhttp.Client which drives the full 3-way
+// handshake transparently on every new TCP connection.
 func (c *ClientNTLM) ensureSession(client *Client) error {
-	// Check if we need a fresh session (first call or credentials changed)
 	credentialsChanged := client.username != c.cachedUser || client.password != c.cachedPass
-
-	if c.ntlmHTTPClient != nil && !credentialsChanged {
-		return nil // reuse existing session
+	if c.useEncryption {
+		if c.rawHTTP != nil && !credentialsChanged {
+			return nil
+		}
+	} else {
+		if c.ntlmHTTPClient != nil && !credentialsChanged {
+			return nil
+		}
 	}
 
 	userName, domain := parseUsernameAndDomain(client.username)
@@ -102,153 +144,394 @@ func (c *ClientNTLM) ensureSession(client *Client) error {
 		return fmt.Errorf("failed to create NTLM client: %w", err)
 	}
 
-	var transport http.RoundTripper = c.transport
 	if c.useEncryption {
-		// Wrap the transport to fix Content-Length after bodgit encrypts the body.
-		transport = &contentLengthFixTransport{base: c.transport}
+		return c.setupEncryptedSession(client, ntlmClient)
 	}
-	httpClient := &http.Client{Transport: transport}
+	return c.setupPlainSession(client, ntlmClient)
+}
 
-	var opts []func(*ntlmhttp.Client) error
-	if c.useEncryption {
-		opts = append(opts, ntlmhttp.Encryption(true))
+// setupEncryptedSession initialises the raw http.Client for the encrypted
+// path. The NTLM 3-way handshake (probe→NEGOTIATE→AUTHENTICATE with empty
+// bodies) is deferred to primeNTLM, called from doPostEncrypted on first use.
+func (c *ClientNTLM) setupEncryptedSession(client *Client, ntlmClient *ntlmssp.Client) error {
+	var pt *http.Transport
+	if t, ok := c.transport.(*http.Transport); ok {
+		pt = t.Clone()
+	} else {
+		pt = &http.Transport{}
+	}
+	pt.MaxConnsPerHost = 1
+	pt.MaxIdleConnsPerHost = 1
+
+	// Track new dials in debug mode to detect unexpected connection recreation.
+	if os.Getenv("WINRM_DEBUG") == "1" {
+		baseDial := pt.DialContext
+		if baseDial == nil {
+			d := &net.Dialer{}
+			baseDial = d.DialContext
+		}
+		connNum := 0
+		pt.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			connNum++
+			ntlmDebug("TCP DIAL #%d → %s", connNum, addr)
+			return baseDial(ctx, network, addr)
+		}
 	}
 
-	ntlmHTTPClient, err := ntlmhttp.NewClient(httpClient, ntlmClient, opts...)
+	rawHTTP := &http.Client{Transport: wrapDebug("raw", pt)}
+
+	c.ntlmClient = ntlmClient
+	c.rawHTTP = rawHTTP
+	c.pinnedTransport = pt
+	c.sessionReady = false
+	c.cachedUser = client.username
+	c.cachedPass = client.password
+	return nil
+}
+
+// setupPlainSession creates a bodgit ntlmhttp.Client for plain (unencrypted)
+// NTLM, which drives the full 3-way handshake transparently.
+func (c *ClientNTLM) setupPlainSession(client *Client, ntlmClient *ntlmssp.Client) error {
+	var pt *http.Transport
+	if t, ok := c.transport.(*http.Transport); ok {
+		pt = t.Clone()
+	} else {
+		pt = &http.Transport{}
+	}
+	pt.MaxConnsPerHost = 1
+
+	// bodgit's NewClient type-asserts rawHTTP.Transport to *http.Transport.
+	// Pass the bare transport here; optionally replace with a debug wrapper after.
+	rawHTTP := &http.Client{Transport: pt}
+
+	ntlmHTTPClient, err := ntlmhttp.NewClient(rawHTTP, ntlmClient)
 	if err != nil {
 		return fmt.Errorf("failed to create NTLM HTTP client: %w", err)
 	}
+
+	// Swap in the debug logger after bodgit has validated the transport.
+	rawHTTP.Transport = wrapDebug("raw", pt)
 
 	c.ntlmClient = ntlmClient
 	c.ntlmHTTPClient = ntlmHTTPClient
 	c.cachedUser = client.username
 	c.cachedPass = client.password
+	c.sessionReady = true
+	return nil
+}
+
+// primeNTLM drives the NTLM 3-way handshake using empty bodies (pywinrm pattern).
+//
+// Step 1: POST empty body, no auth → 401
+// Step 2: POST empty body + NEGOTIATE → 401 + CHALLENGE
+// Step 3: POST empty body + AUTHENTICATE → 200 (session established)
+//
+// This matches pywinrm's setup_encryption() approach: establish the NTLM
+// session on the TCP connection with empty bodies first, then send encrypted
+// SOAP separately on the same connection.
+//
+// Sets c.sessionReady=true on success.
+func (c *ClientNTLM) primeNTLM(urlStr string) error {
+	emptyBody := func(authHeader string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(context.Background(), "POST", urlStr, http.NoBody)
+		if err != nil {
+			return nil, err
+		}
+		req.ContentLength = 0
+		req.Header.Set("Content-Type", soapXML+";charset=UTF-8")
+		if authHeader != "" {
+			req.Header.Set("Authorization", authHeader)
+		}
+		resp, err := c.rawHTTP.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp, nil
+	}
+
+	// Step 1: probe (no auth) → expect 401
+	resp1, err := emptyBody("")
+	if err != nil {
+		return fmt.Errorf("NTLM probe: %w", err)
+	}
+	ntlmDebug("primeNTLM step1(probe): status=%d", resp1.StatusCode)
+	if resp1.StatusCode != http.StatusUnauthorized {
+		return fmt.Errorf("NTLM probe: expected 401, got %d", resp1.StatusCode)
+	}
+
+	// Step 2: NEGOTIATE (empty body) → expect 401 + challenge
+	negotiateToken, err := c.ntlmClient.Authenticate(nil, nil)
+	if err != nil {
+		return fmt.Errorf("NTLM negotiate token: %w", err)
+	}
+	resp2, err := emptyBody("Negotiate " + base64.StdEncoding.EncodeToString(negotiateToken))
+	if err != nil {
+		return fmt.Errorf("NTLM negotiate: %w", err)
+	}
+	ntlmDebug("primeNTLM step2(negotiate): status=%d", resp2.StatusCode)
+	if resp2.StatusCode != http.StatusUnauthorized {
+		return fmt.Errorf("NTLM negotiate: expected 401, got %d", resp2.StatusCode)
+	}
+	challenge, err := extractNTLMToken(resp2)
+	if err != nil {
+		return fmt.Errorf("NTLM negotiate challenge: %w", err)
+	}
+
+	// Step 3: AUTHENTICATE (empty body) → expect 200 (session established)
+	authenticateToken, err := c.ntlmClient.Authenticate(challenge, nil)
+	if err != nil {
+		return fmt.Errorf("NTLM authenticate token: %w", err)
+	}
+	resp3, err := emptyBody("Negotiate " + base64.StdEncoding.EncodeToString(authenticateToken))
+	if err != nil {
+		return fmt.Errorf("NTLM authenticate: %w", err)
+	}
+	ntlmDebug("primeNTLM step3(authenticate): status=%d", resp3.StatusCode)
+	if resp3.StatusCode != http.StatusOK {
+		return fmt.Errorf("NTLM authenticate: expected 200, got %d (check credentials)", resp3.StatusCode)
+	}
+
+	c.sessionReady = true
+	return nil
+}
+
+// extractNTLMToken parses the first "Negotiate <base64>" value from the
+// WWW-Authenticate response header.
+func extractNTLMToken(resp *http.Response) ([]byte, error) {
+	for _, v := range resp.Header[wwwAuthHeader] {
+		if strings.HasPrefix(v, "Negotiate ") {
+			tok, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(v, "Negotiate "))
+			if err != nil {
+				return nil, fmt.Errorf("decode NTLM token: %w", err)
+			}
+			return tok, nil
+		}
+	}
+	return nil, fmt.Errorf("no Negotiate token in WWW-Authenticate header")
+}
+
+// postPlain sends a SOAP message using bodgit's ntlmhttp.Client, which
+// handles NTLM 3-way auth transparently. Requires AllowUnencrypted=true.
+func (c *ClientNTLM) postPlain(client *Client, request *soap.SoapMessage) (string, error) {
+	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url,
+		strings.NewReader(request.String()))
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", soapXML+";charset=UTF-8")
+
+	resp, err := c.ntlmHTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("ntlm plain: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("http %d: %s", resp.StatusCode, body)
+	}
+	return string(body), nil
+}
+
+// postEncrypted sends a SOAP message with NTLM message-level encryption.
+//
+// On the first call it runs primeNTLM (3 empty-body requests) to establish the
+// NTLM session, then sends the encrypted SOAP on the same TCP connection.
+// Subsequent calls reuse the session (no Authorization header).
+//
+// On stale-session errors (401, connection reset, wrong Content-Type) the
+// session is torn down and the request is retried once. Application-level
+// errors (SOAP faults, bad request) are returned immediately without retry.
+func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (string, error) {
+	result, err := c.doPostEncrypted(client, request)
+	if err == nil {
+		return result, nil
+	}
+
+	if !isRetryableSessionError(err) {
+		return "", err
+	}
+
+	// Tear down and retry once — stale keepalive connection or expired session.
+	ntlmDebug("postEncrypted: retryable error=%v; resetting session", err)
+	c.rawHTTP = nil
+	c.pinnedTransport = nil
+	c.ntlmClient = nil
 	c.sessionReady = false
 
-	// For encrypted mode, establish the NTLM session immediately
-	// with an empty POST so the security session is ready for sealing.
-	if c.useEncryption {
-		if err := c.doAuthHandshake(client); err != nil {
-			// Reset session state on failure
-			c.ntlmHTTPClient = nil
-			c.ntlmClient = nil
-			c.sessionReady = false
-			return err
+	if sessionErr := c.ensureSession(client); sessionErr != nil {
+		return "", fmt.Errorf("retry session setup: %w", sessionErr)
+	}
+	return c.doPostEncrypted(client, request)
+}
+
+// doPostEncrypted performs the full encrypted SOAP lifecycle:
+//
+//   - If not yet authenticated (sessionReady==false): runs the NTLM 3-way
+//     empty-body handshake (probe→NEGOTIATE→AUTHENTICATE) to establish the
+//     session, then sends the encrypted SOAP on the same connection.
+//
+//   - If sessionReady==true: seals the SOAP body and sends it without an
+//     Authorization header (session already established on this connection).
+func (c *ClientNTLM) doPostEncrypted(client *Client, request *soap.SoapMessage) (string, error) {
+	soapBytes := []byte(request.String())
+
+	// Run the 3-way empty-body NTLM handshake if session not yet established.
+	if !c.sessionReady {
+		if err := c.primeNTLM(client.url); err != nil {
+			return "", err
 		}
-		c.sessionReady = true
 	}
 
-	return nil
-}
-
-// doAuthHandshake performs the NTLM authentication handshake with an empty
-// POST request. After this completes, the security session is established
-// and can be used for message sealing/unsealing.
-func (c *ClientNTLM) doAuthHandshake(client *Client) error {
-	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url, nil)
+	encBody, encCT, err := c.sealSOAP(soapBytes)
 	if err != nil {
-		return fmt.Errorf("failed to create auth request: %w", err)
+		return "", fmt.Errorf("seal SOAP: %w", err)
 	}
-	req.Header.Set("Content-Type", soapXML+";charset=UTF-8")
-	req.Header.Set("Content-Length", "0")
+
+	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url, bytes.NewReader(encBody))
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", encCT)
 	req.Header.Set("Connection", "Keep-Alive")
+	req.ContentLength = int64(len(encBody))
 
-	resp, err := c.ntlmHTTPClient.Do(req)
+	ntlmDebug("doPostEncrypted: sending sealed SOAP (no auth header — session on conn)")
+
+	resp, err := c.rawHTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("NTLM authentication failed: %w", err)
+		return "", fmt.Errorf("do request: %w", err)
 	}
 	defer resp.Body.Close()
+	ntlmDebug("doPostEncrypted: status=%d ct=%q", resp.StatusCode, resp.Header.Get("Content-Type"))
 
-	if _, err := io.ReadAll(resp.Body); err != nil {
-		return fmt.Errorf("read auth response body: %w", err)
+	if resp.StatusCode == http.StatusUnauthorized {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return "", fmt.Errorf("session expired (401)")
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("NTLM auth http error %d", resp.StatusCode)
-	}
-
-	return nil
+	return c.unsealResponse(resp)
 }
 
-// postPlain sends a SOAP request without message-level encryption.
-// The NTLM handshake happens transparently via bodgit's HTTP client.
-func (c *ClientNTLM) postPlain(client *Client, request *soap.SoapMessage) (string, error) {
-	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url, strings.NewReader(request.String()))
-	if err != nil {
-		return "", fmt.Errorf("impossible to create http request %w", err)
+// sealSOAP encrypts soapBytes using the established NTLM security session
+// and builds the multipart/encrypted body required by MS-WSMV.
+//
+// Wire format for the encrypted payload (second MIME part):
+//
+//	[4-byte LE: len(signature)] [signature bytes] [sealed body bytes]
+//
+// The multipart format matches pywinrm's _encrypt_message:
+// - OriginalContent Length = len(soapBytes) (original, not encrypted)
+// - No \r\n before the closing boundary delimiter
+func (c *ClientNTLM) sealSOAP(soapBytes []byte) (body []byte, ct string, err error) {
+	session := c.ntlmClient.SecuritySession()
+	if session == nil {
+		return nil, "", fmt.Errorf("no NTLM security session available")
 	}
-	req.Header.Set("Content-Type", soapXML+";charset=UTF-8")
 
-	resp, err := c.ntlmHTTPClient.Do(req)
+	sealed, signature, err := session.Wrap(soapBytes)
 	if err != nil {
-		return "", fmt.Errorf("unknown error %w", err)
+		return nil, "", fmt.Errorf("session.Wrap: %w", err)
 	}
 
-	defer resp.Body.Close()
+	// Build payload: 4-byte LE signature length + signature + sealed body.
+	payload := make([]byte, 4+len(signature)+len(sealed))
+	binary.LittleEndian.PutUint32(payload[0:4], uint32(len(signature)))
+	copy(payload[4:], signature)
+	copy(payload[4+len(signature):], sealed)
+
+	body, ct = buildEncryptedMultipart(payload, soapXML+";charset=UTF-8", len(soapBytes))
+	ntlmDebug("sealSOAP: payload=%d sigLen=%d sealedLen=%d totalBody=%d",
+		len(payload), len(signature), len(sealed), len(body))
+	return body, ct, nil
+}
+
+// buildEncryptedMultipart constructs the multipart/encrypted MIME body required
+// by MS-WSMV §2.2.9.1 for NTLM-encrypted SOAP messages.
+//
+// Format (matches pywinrm _encrypt_message exactly):
+//
+//	--Encrypted Boundary\r\n
+//	\tContent-Type: application/HTTP-SPNEGO-session-encrypted\r\n
+//	\tOriginalContent: type=<contentType>;Length=<originalLen>\r\n
+//	--Encrypted Boundary\r\n
+//	\tContent-Type: application/octet-stream\r\n
+//	[payload][--Encrypted Boundary--\r\n]
+//
+// Note: originalLen must be len(original SOAP), NOT len(encrypted payload).
+// Note: no \r\n before the closing boundary delimiter (pywinrm-compatible).
+func buildEncryptedMultipart(payload []byte, contentType string, originalLen int) ([]byte, string) {
+	const boundary = "Encrypted Boundary"
+	const protocol = "application/HTTP-SPNEGO-session-encrypted"
+	const ct = "multipart/encrypted;protocol=\"" + protocol + "\";boundary=\"" + boundary + "\""
+
+	var b []byte
+	b = append(b, "--"+boundary+"\r\n"...)
+	b = append(b, "\tContent-Type: "+protocol+"\r\n"...)
+	b = append(b, "\tOriginalContent: type="+contentType+";Length="+fmt.Sprintf("%d", originalLen)+"\r\n"...)
+	b = append(b, "--"+boundary+"\r\n"...)
+	b = append(b, "\tContent-Type: application/octet-stream\r\n"...)
+	b = append(b, payload...)
+	// No \r\n before closing boundary — matches pywinrm's format
+	b = append(b, "--"+boundary+"--\r\n"...)
+	return b, ct
+}
+
+// unsealResponse decrypts an encrypted WinRM response.
+// It uses ntlmhttp.Unwrap to extract the raw payload, then ntlmssp to
+// decrypt and verify the sealed body.
+func (c *ClientNTLM) unsealResponse(resp *http.Response) (string, error) {
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("error reading response body: %w", err)
+		return "", fmt.Errorf("read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("http error %d: %s", resp.StatusCode, string(respBody))
+		return "", fmt.Errorf("http %d: %s", resp.StatusCode, respBody)
 	}
 
-	if !strings.Contains(resp.Header.Get("Content-Type"), "application/soap+xml") {
-		return "", fmt.Errorf("invalid content type")
-	}
-
-	return string(respBody), nil
-}
-
-// postEncrypted sends a SOAP request with NTLM message-level encryption.
-// The NTLM session must already be established via doAuthHandshake().
-// bodgit's HTTP client automatically wraps (seals) the request and
-// unwraps (unseals) the response.
-func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (string, error) {
-	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url, strings.NewReader(request.String()))
+	ct := resp.Header.Get("Content-Type")
+	payload, _, err := ntlmhttp.Unwrap(respBody, ct)
 	if err != nil {
-		return "", fmt.Errorf("failed to create SOAP request: %w", err)
+		return "", fmt.Errorf("ntlmhttp.Unwrap: %w", err)
 	}
-	req.Header.Set("Content-Type", soapXML+";charset=UTF-8")
-	req.Header.Set("Connection", "Keep-Alive")
 
-	resp, err := c.ntlmHTTPClient.Do(req)
+	if len(payload) < 4 {
+		return "", fmt.Errorf("encrypted payload too short (%d bytes)", len(payload))
+	}
+	sigLen := binary.LittleEndian.Uint32(payload[0:4])
+	if int(4+sigLen) > len(payload) {
+		return "", fmt.Errorf("signature length %d exceeds payload size %d", sigLen, len(payload))
+	}
+	signature := payload[4 : 4+sigLen]
+	sealed := payload[4+sigLen:]
+
+	session := c.ntlmClient.SecuritySession()
+	if session == nil {
+		return "", fmt.Errorf("no NTLM security session for decryption")
+	}
+	plain, err := session.Unwrap(sealed, signature)
 	if err != nil {
-		// Session may have expired — reset and let next call re-establish
-		c.ntlmHTTPClient = nil
-		c.sessionReady = false
-		return "", fmt.Errorf("encrypted request failed: %w", err)
+		return "", fmt.Errorf("session.Unwrap: %w", err)
 	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("error reading response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("http error %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	return string(respBody), nil
+	return string(plain), nil
 }
 
 // NewClientNTLMWithDial creates a new NTLM transport with a custom dialer.
 func NewClientNTLMWithDial(dial func(network, addr string) (net.Conn, error)) *ClientNTLM {
 	return &ClientNTLM{
-		clientRequest: clientRequest{
-			dial: dial,
-		},
+		clientRequest: clientRequest{dial: dial},
 	}
 }
 
 // NewClientNTLMWithProxyFunc creates a new NTLM transport with a custom proxy function.
 func NewClientNTLMWithProxyFunc(proxyfunc func(req *http.Request) (*url.URL, error)) *ClientNTLM {
 	return &ClientNTLM{
-		clientRequest: clientRequest{
-			proxyfunc: proxyfunc,
-		},
+		clientRequest: clientRequest{proxyfunc: proxyfunc},
 	}
 }
 
@@ -284,7 +567,48 @@ func parseUsernameAndDomain(username string) (string, string) {
 		return parts[0], parts[1]
 	} else if strings.Contains(username, "\\") {
 		parts := strings.Split(username, "\\")
-		return parts[1], parts[0]
+		user, domain := parts[1], parts[0]
+		// ".\\user" means local account — Windows rejects domain="." in NTLM
+		if domain == "." {
+			domain = ""
+		}
+		return user, domain
 	}
 	return username, ""
+}
+
+// isEncryptionError reports whether err is a Content-Type mismatch from
+// ntlmhttp.Unwrap — the server returned a non-multipart response on an
+// established encrypted session.
+func isEncryptionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "no Content-Type header") ||
+		strings.Contains(msg, "incorrect Content-Type value")
+}
+
+// isRetryableSessionError reports whether err warrants tearing down the NTLM
+// session and retrying. It returns true for errors caused by a stale TCP
+// connection or an expired server-side session:
+//   - TCP-level errors (connection reset, EOF): server closed the keepalive conn
+//   - "session expired (401)": server rejected our credentials mid-session
+//   - isEncryptionError: server returned a non-encrypted response (session lost)
+//
+// Application-level errors (SOAP faults, malformed requests) return false so
+// they are surfaced to the caller immediately without an unnecessary retry.
+func isRetryableSessionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isEncryptionError(err) {
+		return true
+	}
+	if strings.Contains(err.Error(), "session expired (401)") {
+		return true
+	}
+	// net.OpError covers connection reset, broken pipe, EOF from the TCP layer.
+	var opErr *net.OpError
+	return errors.As(err, &opErr)
 }
