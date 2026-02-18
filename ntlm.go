@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -213,8 +214,6 @@ func (c *ClientNTLM) setupPlainSession(client *Client, ntlmClient *ntlmssp.Clien
 
 	c.ntlmClient = ntlmClient
 	c.ntlmHTTPClient = ntlmHTTPClient
-	c.rawHTTP = rawHTTP
-	c.pinnedTransport = pt
 	c.cachedUser = client.username
 	c.cachedPass = client.password
 	c.sessionReady = true
@@ -344,16 +343,21 @@ func (c *ClientNTLM) postPlain(client *Client, request *soap.SoapMessage) (strin
 // NTLM session, then sends the encrypted SOAP on the same TCP connection.
 // Subsequent calls reuse the session (no Authorization header).
 //
-// On any error the session is torn down and the attempt is retried once
-// (recovers from stale keepalive connections).
+// On stale-session errors (401, connection reset, wrong Content-Type) the
+// session is torn down and the request is retried once. Application-level
+// errors (SOAP faults, bad request) are returned immediately without retry.
 func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (string, error) {
 	result, err := c.doPostEncrypted(client, request)
 	if err == nil {
 		return result, nil
 	}
 
-	// Tear down and retry once on any error — stale keepalive connection.
-	ntlmDebug("postEncrypted: error=%v; resetting session", err)
+	if !isRetryableSessionError(err) {
+		return "", err
+	}
+
+	// Tear down and retry once — stale keepalive connection or expired session.
+	ntlmDebug("postEncrypted: retryable error=%v; resetting session", err)
 	c.rawHTTP = nil
 	c.pinnedTransport = nil
 	c.ntlmClient = nil
@@ -573,9 +577,9 @@ func parseUsernameAndDomain(username string) (string, string) {
 	return username, ""
 }
 
-// isEncryptionError reports whether err looks like a failure in the NTLM
-// message encryption/decryption layer (e.g. from ntlmhttp.Unwrap). These
-// errors indicate a stale session that can be recovered by re-handshaking.
+// isEncryptionError reports whether err is a Content-Type mismatch from
+// ntlmhttp.Unwrap — the server returned a non-multipart response on an
+// established encrypted session.
 func isEncryptionError(err error) bool {
 	if err == nil {
 		return false
@@ -583,4 +587,28 @@ func isEncryptionError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "no Content-Type header") ||
 		strings.Contains(msg, "incorrect Content-Type value")
+}
+
+// isRetryableSessionError reports whether err warrants tearing down the NTLM
+// session and retrying. It returns true for errors caused by a stale TCP
+// connection or an expired server-side session:
+//   - TCP-level errors (connection reset, EOF): server closed the keepalive conn
+//   - "session expired (401)": server rejected our credentials mid-session
+//   - isEncryptionError: server returned a non-encrypted response (session lost)
+//
+// Application-level errors (SOAP faults, malformed requests) return false so
+// they are surfaced to the caller immediately without an unnecessary retry.
+func isRetryableSessionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isEncryptionError(err) {
+		return true
+	}
+	if strings.Contains(err.Error(), "session expired (401)") {
+		return true
+	}
+	// net.OpError covers connection reset, broken pipe, EOF from the TCP layer.
+	var opErr *net.OpError
+	return errors.As(err, &opErr)
 }
