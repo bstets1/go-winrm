@@ -209,7 +209,48 @@ func (c *ClientNTLM) postPlain(client *Client, request *soap.SoapMessage) (strin
 // The NTLM session must already be established via doAuthHandshake().
 // bodgit's HTTP client automatically wraps (seals) the request and
 // unwraps (unseals) the response.
+//
+// If the first attempt fails with an encryption-related error (e.g. stale
+// keepalive connection), the session is re-established and the request is
+// retried once. If the retry also fails with an encryption error, a
+// descriptive message is returned suggesting the server may not support
+// NTLM message encryption.
 func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (string, error) {
+	result, err := c.doPostEncrypted(client, request)
+	if err == nil {
+		return result, nil
+	}
+
+	if !isEncryptionError(err) {
+		return "", err
+	}
+
+	// The NTLM session may be stale (server closed the keepalive
+	// connection, or the security context expired). Re-establish
+	// the session from scratch and retry once.
+	c.ntlmHTTPClient = nil
+	c.ntlmClient = nil
+	c.sessionReady = false
+
+	if sessionErr := c.ensureSession(client); sessionErr != nil {
+		return "", fmt.Errorf("encrypted request failed (retry re-auth failed): %w", sessionErr)
+	}
+
+	result, retryErr := c.doPostEncrypted(client, request)
+	if retryErr != nil {
+		if isEncryptionError(retryErr) {
+			return "", fmt.Errorf("server did not return an encrypted response; "+
+				"it may not support NTLM message-level encryption — "+
+				"try plain NTLM (without encryption) or use HTTPS: %w", retryErr)
+		}
+		return "", retryErr
+	}
+
+	return result, nil
+}
+
+// doPostEncrypted performs a single encrypted SOAP round-trip.
+func (c *ClientNTLM) doPostEncrypted(client *Client, request *soap.SoapMessage) (string, error) {
 	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url, strings.NewReader(request.String()))
 	if err != nil {
 		return "", fmt.Errorf("failed to create SOAP request: %w", err)
@@ -219,7 +260,7 @@ func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (s
 
 	resp, err := c.ntlmHTTPClient.Do(req)
 	if err != nil {
-		// Session may have expired — reset and let next call re-establish
+		// Session may have expired — reset so next call re-establishes
 		c.ntlmHTTPClient = nil
 		c.sessionReady = false
 		return "", fmt.Errorf("encrypted request failed: %w", err)
@@ -236,6 +277,18 @@ func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (s
 	}
 
 	return string(respBody), nil
+}
+
+// isEncryptionError reports whether err looks like a failure in the NTLM
+// message encryption/decryption layer (bodgit's wrap/unwrap). These errors
+// are recoverable by re-establishing the NTLM session.
+func isEncryptionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "no Content-Type header") ||
+		strings.Contains(msg, "incorrect Content-Type value")
 }
 
 // NewClientNTLMWithDial creates a new NTLM transport with a custom dialer.

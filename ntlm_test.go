@@ -1,9 +1,9 @@
 package winrm
 
 import (
-	"net/http"
-
+	"fmt"
 	"net"
+	"net/http"
 	"time"
 
 	. "gopkg.in/check.v1"
@@ -118,4 +118,23 @@ func (s *WinRMSuite) TestNTLMEncryptedViaEncryptionWrapper(c *C) {
 	endpoint := NewEndpoint("localhost", 5985, false, false, nil, nil, nil, 0)
 	err = enc.Transport(endpoint)
 	c.Assert(err, IsNil)
+}
+
+func (s *WinRMSuite) TestIsEncryptionErrorNoContentType(c *C) {
+	err := fmt.Errorf("encrypted request failed: no Content-Type header")
+	c.Assert(isEncryptionError(err), Equals, true)
+}
+
+func (s *WinRMSuite) TestIsEncryptionErrorIncorrectContentType(c *C) {
+	err := fmt.Errorf("encrypted request failed: incorrect Content-Type value")
+	c.Assert(isEncryptionError(err), Equals, true)
+}
+
+func (s *WinRMSuite) TestIsEncryptionErrorNil(c *C) {
+	c.Assert(isEncryptionError(nil), Equals, false)
+}
+
+func (s *WinRMSuite) TestIsEncryptionErrorUnrelated(c *C) {
+	err := fmt.Errorf("connection refused")
+	c.Assert(isEncryptionError(err), Equals, false)
 }
