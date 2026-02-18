@@ -1,6 +1,7 @@
 package winrm
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -14,6 +15,31 @@ import (
 	ntlmhttp "github.com/bodgit/ntlmssp/http"
 	"github.com/masterzen/winrm/soap"
 )
+
+// contentLengthFixTransport works around a bug in bodgit/ntlmssp where the
+// HTTP client's wrap() method replaces the request body with the encrypted
+// (sealed) payload but does not update req.ContentLength. This causes Go's
+// net/http transport to reject the request with:
+//
+//	"http: ContentLength=N with Body length M"
+//
+// This wrapper reads the final body, sets ContentLength to the actual size,
+// and forwards the request to the real transport.
+type contentLengthFixTransport struct {
+	base http.RoundTripper
+}
+
+func (t *contentLengthFixTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.ContentLength = int64(len(body))
+	}
+	return t.base.RoundTrip(req)
+}
 
 // ClientNTLM provides a transport via NTLMv2 using bodgit/ntlmssp.
 // When useEncryption is true, SOAP messages are sealed (encrypted) using
@@ -86,6 +112,15 @@ func (c *ClientNTLM) ensureSession(client *Client) error {
 	ntlmHTTPClient, err := ntlmhttp.NewClient(httpClient, ntlmClient, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to create NTLM HTTP client: %w", err)
+	}
+
+	// Swap in our Content-Length fixing transport AFTER bodgit's NewClient()
+	// has validated the *http.Transport (it type-asserts to check
+	// DisableKeepAlives). bodgit stores the *http.Client by reference, so
+	// subsequent Do() calls will use our wrapper, which recalculates
+	// Content-Length after bodgit encrypts (seals) the body.
+	if c.useEncryption {
+		httpClient.Transport = &contentLengthFixTransport{base: c.transport}
 	}
 
 	c.ntlmClient = ntlmClient
@@ -175,15 +210,7 @@ func (c *ClientNTLM) postPlain(client *Client, request *soap.SoapMessage) (strin
 // bodgit's HTTP client automatically wraps (seals) the request and
 // unwraps (unseals) the response.
 func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (string, error) {
-	// Wrap the body so it only exposes io.Reader (not Len()).
-	// http.NewRequestWithContext sniffs for *strings.Reader / *bytes.Buffer
-	// and pre-sets ContentLength from Len(). bodgit's ntlmssp wrap() then
-	// replaces the body with the encrypted (sealed) payload — which is
-	// larger — without updating ContentLength, causing:
-	//   "http: ContentLength=N with Body length M"
-	// By hiding Len(), ContentLength stays -1 and Go uses chunked encoding.
-	body := io.NopCloser(strings.NewReader(request.String()))
-	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url, body)
+	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url, strings.NewReader(request.String()))
 	if err != nil {
 		return "", fmt.Errorf("failed to create SOAP request: %w", err)
 	}
