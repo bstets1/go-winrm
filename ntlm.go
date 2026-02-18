@@ -50,13 +50,12 @@ type ClientNTLM struct {
 	useEncryption bool
 
 	// Cached session state — reused across Post() calls to avoid
-	// re-handshaking on every request. Protected by mu.
+	// re-creating the bodgit client on every request. Protected by mu.
 	mu             sync.Mutex
 	ntlmClient     *ntlmssp.Client
 	ntlmHTTPClient *ntlmhttp.Client
 	cachedUser     string
 	cachedPass     string
-	sessionReady   bool // true after encrypted session handshake completes
 }
 
 // Transport creates the base HTTP transport for NTLM connections.
@@ -82,7 +81,12 @@ func (c *ClientNTLM) Post(client *Client, request *soap.SoapMessage) (string, er
 
 // ensureSession creates or reuses the bodgit NTLM client and HTTP client.
 // If credentials changed, the session is re-created.
-// For encrypted sessions, performs the initial auth handshake if needed.
+//
+// No separate auth handshake is performed here. bodgit's Do() handles
+// the full NTLM Negotiate → Challenge → Authenticate flow inline with
+// the actual SOAP request. This ensures the handshake and the encrypted
+// payload travel on the same TCP connection, which is required because
+// NTLM sessions are bound to the connection.
 func (c *ClientNTLM) ensureSession(client *Client) error {
 	// Check if we need a fresh session (first call or credentials changed)
 	credentialsChanged := client.username != c.cachedUser || client.password != c.cachedPass
@@ -127,49 +131,6 @@ func (c *ClientNTLM) ensureSession(client *Client) error {
 	c.ntlmHTTPClient = ntlmHTTPClient
 	c.cachedUser = client.username
 	c.cachedPass = client.password
-	c.sessionReady = false
-
-	// For encrypted mode, establish the NTLM session immediately
-	// with an empty POST so the security session is ready for sealing.
-	if c.useEncryption {
-		if err := c.doAuthHandshake(client); err != nil {
-			// Reset session state on failure
-			c.ntlmHTTPClient = nil
-			c.ntlmClient = nil
-			c.sessionReady = false
-			return err
-		}
-		c.sessionReady = true
-	}
-
-	return nil
-}
-
-// doAuthHandshake performs the NTLM authentication handshake with an empty
-// POST request. After this completes, the security session is established
-// and can be used for message sealing/unsealing.
-func (c *ClientNTLM) doAuthHandshake(client *Client) error {
-	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create auth request: %w", err)
-	}
-	req.Header.Set("Content-Type", soapXML+";charset=UTF-8")
-	req.Header.Set("Content-Length", "0")
-	req.Header.Set("Connection", "Keep-Alive")
-
-	resp, err := c.ntlmHTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("NTLM authentication failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if _, err := io.ReadAll(resp.Body); err != nil {
-		return fmt.Errorf("read auth response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("NTLM auth http error %d", resp.StatusCode)
-	}
 
 	return nil
 }
@@ -206,15 +167,19 @@ func (c *ClientNTLM) postPlain(client *Client, request *soap.SoapMessage) (strin
 }
 
 // postEncrypted sends a SOAP request with NTLM message-level encryption.
-// The NTLM session must already be established via doAuthHandshake().
-// bodgit's HTTP client automatically wraps (seals) the request and
-// unwraps (unseals) the response.
 //
-// If the first attempt fails with an encryption-related error (e.g. stale
-// keepalive connection), the session is re-established and the request is
-// retried once. If the retry also fails with an encryption error, the
-// server does not support NTLM message encryption and we fall back to
-// plain NTLM authentication for this and all subsequent requests.
+// bodgit's Do() handles the complete flow in a single call:
+//  1. Sends the request (plain on first call since NTLM isn't complete yet)
+//  2. Receives 401 with WWW-Authenticate: Negotiate
+//  3. Performs the NTLM Negotiate → Challenge → Authenticate handshake
+//  4. Re-sends the request (now with wrap/seal since the session is established)
+//  5. Receives the encrypted response and unwraps it
+//
+// On subsequent calls the NTLM session is already complete, so bodgit
+// wraps the request, sends it, and unwraps the response directly.
+//
+// If the session becomes stale (e.g. server closed the keepalive
+// connection), the request is retried with a fresh NTLM client.
 func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (string, error) {
 	result, err := c.doPostEncrypted(client, request)
 	if err == nil {
@@ -226,40 +191,20 @@ func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (s
 	}
 
 	// The NTLM session may be stale (server closed the keepalive
-	// connection, or the security context expired). Re-establish
-	// the session from scratch and retry once.
+	// connection, or the security context expired). Create a fresh
+	// NTLM client so Do() performs a new handshake inline.
 	c.ntlmHTTPClient = nil
 	c.ntlmClient = nil
-	c.sessionReady = false
 
 	if sessionErr := c.ensureSession(client); sessionErr != nil {
-		return "", fmt.Errorf("encrypted request failed (retry re-auth failed): %w", sessionErr)
+		return "", fmt.Errorf("encrypted request retry failed during session setup: %w", sessionErr)
 	}
 
-	result, retryErr := c.doPostEncrypted(client, request)
-	if retryErr == nil {
-		return result, nil
-	}
-
-	if !isEncryptionError(retryErr) {
-		return "", retryErr
-	}
-
-	// Server does not support NTLM message-level encryption.
-	// Fall back to plain NTLM auth for this and all future requests.
-	c.useEncryption = false
-	c.ntlmHTTPClient = nil
-	c.ntlmClient = nil
-	c.sessionReady = false
-
-	if sessionErr := c.ensureSession(client); sessionErr != nil {
-		return "", fmt.Errorf("NTLM encryption not supported and plain fallback failed: %w", sessionErr)
-	}
-
-	return c.postPlain(client, request)
+	return c.doPostEncrypted(client, request)
 }
 
 // doPostEncrypted performs a single encrypted SOAP round-trip.
+// bodgit's Do() transparently handles NTLM auth and message encryption.
 func (c *ClientNTLM) doPostEncrypted(client *Client, request *soap.SoapMessage) (string, error) {
 	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url, strings.NewReader(request.String()))
 	if err != nil {
@@ -272,7 +217,6 @@ func (c *ClientNTLM) doPostEncrypted(client *Client, request *soap.SoapMessage) 
 	if err != nil {
 		// Session may have expired — reset so next call re-establishes
 		c.ntlmHTTPClient = nil
-		c.sessionReady = false
 		return "", fmt.Errorf("encrypted request failed: %w", err)
 	}
 	defer resp.Body.Close()
