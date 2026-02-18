@@ -1,6 +1,7 @@
 package winrm
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -75,7 +76,7 @@ func (c *ClientNTLM) ensureSession(client *Client) error {
 		return fmt.Errorf("failed to create NTLM client: %w", err)
 	}
 
-	httpClient := &http.Client{Transport: c.clientRequest.transport}
+	httpClient := &http.Client{Transport: c.transport}
 
 	var opts []func(*ntlmhttp.Client) error
 	if c.useEncryption {
@@ -113,7 +114,7 @@ func (c *ClientNTLM) ensureSession(client *Client) error {
 // POST request. After this completes, the security session is established
 // and can be used for message sealing/unsealing.
 func (c *ClientNTLM) doAuthHandshake(client *Client) error {
-	req, err := http.NewRequest("POST", client.url, nil)
+	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create auth request: %w", err)
 	}
@@ -125,10 +126,11 @@ func (c *ClientNTLM) doAuthHandshake(client *Client) error {
 	if err != nil {
 		return fmt.Errorf("NTLM authentication failed: %w", err)
 	}
+	defer resp.Body.Close()
+
 	if _, err := io.ReadAll(resp.Body); err != nil {
 		return fmt.Errorf("read auth response body: %w", err)
 	}
-	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("NTLM auth http error %d", resp.StatusCode)
@@ -140,7 +142,7 @@ func (c *ClientNTLM) doAuthHandshake(client *Client) error {
 // postPlain sends a SOAP request without message-level encryption.
 // The NTLM handshake happens transparently via bodgit's HTTP client.
 func (c *ClientNTLM) postPlain(client *Client, request *soap.SoapMessage) (string, error) {
-	req, err := http.NewRequest("POST", client.url, strings.NewReader(request.String()))
+	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url, strings.NewReader(request.String()))
 	if err != nil {
 		return "", fmt.Errorf("impossible to create http request %w", err)
 	}
@@ -173,7 +175,7 @@ func (c *ClientNTLM) postPlain(client *Client, request *soap.SoapMessage) (strin
 // bodgit's HTTP client automatically wraps (seals) the request and
 // unwraps (unseals) the response.
 func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (string, error) {
-	req, err := http.NewRequest("POST", client.url, strings.NewReader(request.String()))
+	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url, strings.NewReader(request.String()))
 	if err != nil {
 		return "", fmt.Errorf("failed to create SOAP request: %w", err)
 	}

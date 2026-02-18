@@ -100,14 +100,14 @@ func (s *WinRMSuite) TestNewClientNTLMEncryptedWithDial(c *C) {
 	}
 	client := NewClientNTLMEncryptedWithDial(dial)
 	c.Assert(client.useEncryption, Equals, true)
-	c.Assert(client.clientRequest.dial, NotNil)
+	c.Assert(client.dial, NotNil)
 }
 
 func (s *WinRMSuite) TestNewClientNTLMEncryptedWithProxyFunc(c *C) {
 	proxy := http.ProxyFromEnvironment
 	client := NewClientNTLMEncryptedWithProxyFunc(proxy)
 	c.Assert(client.useEncryption, Equals, true)
-	c.Assert(client.clientRequest.proxyfunc, NotNil)
+	c.Assert(client.proxyfunc, NotNil)
 }
 
 func (s *WinRMSuite) TestNTLMEncryptedViaEncryptionWrapper(c *C) {
