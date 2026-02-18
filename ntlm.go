@@ -212,9 +212,9 @@ func (c *ClientNTLM) postPlain(client *Client, request *soap.SoapMessage) (strin
 //
 // If the first attempt fails with an encryption-related error (e.g. stale
 // keepalive connection), the session is re-established and the request is
-// retried once. If the retry also fails with an encryption error, a
-// descriptive message is returned suggesting the server may not support
-// NTLM message encryption.
+// retried once. If the retry also fails with an encryption error, the
+// server does not support NTLM message encryption and we fall back to
+// plain NTLM authentication for this and all subsequent requests.
 func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (string, error) {
 	result, err := c.doPostEncrypted(client, request)
 	if err == nil {
@@ -237,16 +237,26 @@ func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (s
 	}
 
 	result, retryErr := c.doPostEncrypted(client, request)
-	if retryErr != nil {
-		if isEncryptionError(retryErr) {
-			return "", fmt.Errorf("server did not return an encrypted response; "+
-				"it may not support NTLM message-level encryption — "+
-				"try plain NTLM (without encryption) or use HTTPS: %w", retryErr)
-		}
+	if retryErr == nil {
+		return result, nil
+	}
+
+	if !isEncryptionError(retryErr) {
 		return "", retryErr
 	}
 
-	return result, nil
+	// Server does not support NTLM message-level encryption.
+	// Fall back to plain NTLM auth for this and all future requests.
+	c.useEncryption = false
+	c.ntlmHTTPClient = nil
+	c.ntlmClient = nil
+	c.sessionReady = false
+
+	if sessionErr := c.ensureSession(client); sessionErr != nil {
+		return "", fmt.Errorf("NTLM encryption not supported and plain fallback failed: %w", sessionErr)
+	}
+
+	return c.postPlain(client, request)
 }
 
 // doPostEncrypted performs a single encrypted SOAP round-trip.
