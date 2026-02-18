@@ -50,12 +50,13 @@ type ClientNTLM struct {
 	useEncryption bool
 
 	// Cached session state — reused across Post() calls to avoid
-	// re-creating the bodgit client on every request. Protected by mu.
+	// re-handshaking on every request. Protected by mu.
 	mu             sync.Mutex
 	ntlmClient     *ntlmssp.Client
 	ntlmHTTPClient *ntlmhttp.Client
 	cachedUser     string
 	cachedPass     string
+	sessionReady   bool // true after encrypted session handshake completes
 }
 
 // Transport creates the base HTTP transport for NTLM connections.
@@ -82,11 +83,16 @@ func (c *ClientNTLM) Post(client *Client, request *soap.SoapMessage) (string, er
 // ensureSession creates or reuses the bodgit NTLM client and HTTP client.
 // If credentials changed, the session is re-created.
 //
-// No separate auth handshake is performed here. bodgit's Do() handles
-// the full NTLM Negotiate → Challenge → Authenticate flow inline with
-// the actual SOAP request. This ensures the handshake and the encrypted
-// payload travel on the same TCP connection, which is required because
-// NTLM sessions are bound to the connection.
+// For encrypted sessions, a separate auth handshake with an empty body is
+// performed first. This establishes the NTLM security session so that
+// subsequent requests can seal/unseal messages. The handshake sends an
+// empty POST (which the server accepts even with AllowUnencrypted=false)
+// and the following encrypted requests reuse the same TCP connection.
+//
+// To guarantee connection affinity (NTLM sessions are bound to the TCP
+// connection), encrypted sessions use a cloned transport with
+// MaxConnsPerHost=1, which forces all requests to the same host through
+// a single connection.
 func (c *ClientNTLM) ensureSession(client *Client) error {
 	// Check if we need a fresh session (first call or credentials changed)
 	credentialsChanged := client.username != c.cachedUser || client.password != c.cachedPass
@@ -106,7 +112,20 @@ func (c *ClientNTLM) ensureSession(client *Client) error {
 		return fmt.Errorf("failed to create NTLM client: %w", err)
 	}
 
-	httpClient := &http.Client{Transport: c.transport}
+	// For encrypted mode, clone the transport and pin to a single
+	// connection per host. This ensures the NTLM auth handshake and
+	// all subsequent sealed requests travel on the same TCP connection,
+	// which is required because NTLM sessions are connection-bound.
+	var baseTransport http.RoundTripper = c.transport
+	if c.useEncryption {
+		if t, ok := c.transport.(*http.Transport); ok {
+			pinned := t.Clone()
+			pinned.MaxConnsPerHost = 1
+			baseTransport = pinned
+		}
+	}
+
+	httpClient := &http.Client{Transport: baseTransport}
 
 	var opts []func(*ntlmhttp.Client) error
 	if c.useEncryption {
@@ -124,13 +143,61 @@ func (c *ClientNTLM) ensureSession(client *Client) error {
 	// subsequent Do() calls will use our wrapper, which recalculates
 	// Content-Length after bodgit encrypts (seals) the body.
 	if c.useEncryption {
-		httpClient.Transport = &contentLengthFixTransport{base: c.transport}
+		httpClient.Transport = &contentLengthFixTransport{base: baseTransport}
 	}
 
 	c.ntlmClient = ntlmClient
 	c.ntlmHTTPClient = ntlmHTTPClient
 	c.cachedUser = client.username
 	c.cachedPass = client.password
+	c.sessionReady = false
+
+	// For encrypted mode, establish the NTLM session immediately
+	// with an empty POST so the security session is ready for sealing.
+	// The empty body is accepted by the server even with
+	// AllowUnencrypted=false. MaxConnsPerHost=1 guarantees this
+	// handshake and subsequent encrypted requests share the same
+	// TCP connection.
+	if c.useEncryption {
+		if err := c.doAuthHandshake(client); err != nil {
+			c.ntlmHTTPClient = nil
+			c.ntlmClient = nil
+			c.sessionReady = false
+			return err
+		}
+		c.sessionReady = true
+	}
+
+	return nil
+}
+
+// doAuthHandshake performs the NTLM authentication handshake with an empty
+// POST request. After this completes, the security session is established
+// and can be used for message sealing/unsealing.
+func (c *ClientNTLM) doAuthHandshake(client *Client) error {
+	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create auth request: %w", err)
+	}
+	req.Header.Set("Content-Type", soapXML+";charset=UTF-8")
+	req.Header.Set("Content-Length", "0")
+	req.Header.Set("Connection", "Keep-Alive")
+
+	resp, err := c.ntlmHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("NTLM authentication failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Fully drain the response body to ensure the TCP connection is
+	// returned to the pool for reuse by subsequent encrypted requests.
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return fmt.Errorf("draining auth response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("NTLM auth http error %d", resp.StatusCode)
+	}
 
 	return nil
 }
@@ -167,19 +234,13 @@ func (c *ClientNTLM) postPlain(client *Client, request *soap.SoapMessage) (strin
 }
 
 // postEncrypted sends a SOAP request with NTLM message-level encryption.
+// The NTLM session must already be established via doAuthHandshake().
+// bodgit's HTTP client automatically wraps (seals) the request and
+// unwraps (unseals) the response.
 //
-// bodgit's Do() handles the complete flow in a single call:
-//  1. Sends the request (plain on first call since NTLM isn't complete yet)
-//  2. Receives 401 with WWW-Authenticate: Negotiate
-//  3. Performs the NTLM Negotiate → Challenge → Authenticate handshake
-//  4. Re-sends the request (now with wrap/seal since the session is established)
-//  5. Receives the encrypted response and unwraps it
-//
-// On subsequent calls the NTLM session is already complete, so bodgit
-// wraps the request, sends it, and unwraps the response directly.
-//
-// If the session becomes stale (e.g. server closed the keepalive
-// connection), the request is retried with a fresh NTLM client.
+// If the request fails with an encryption-related error (e.g. the server
+// closed the keepalive connection), the session is torn down and
+// re-established with a fresh handshake, then the request is retried.
 func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (string, error) {
 	result, err := c.doPostEncrypted(client, request)
 	if err == nil {
@@ -191,10 +252,10 @@ func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (s
 	}
 
 	// The NTLM session may be stale (server closed the keepalive
-	// connection, or the security context expired). Create a fresh
-	// NTLM client so Do() performs a new handshake inline.
+	// connection). Tear down and re-establish with a new handshake.
 	c.ntlmHTTPClient = nil
 	c.ntlmClient = nil
+	c.sessionReady = false
 
 	if sessionErr := c.ensureSession(client); sessionErr != nil {
 		return "", fmt.Errorf("encrypted request retry failed during session setup: %w", sessionErr)
@@ -204,7 +265,8 @@ func (c *ClientNTLM) postEncrypted(client *Client, request *soap.SoapMessage) (s
 }
 
 // doPostEncrypted performs a single encrypted SOAP round-trip.
-// bodgit's Do() transparently handles NTLM auth and message encryption.
+// The NTLM session must already be established (Complete()==true) so that
+// bodgit's wrap() seals the request and unwrap() unseals the response.
 func (c *ClientNTLM) doPostEncrypted(client *Client, request *soap.SoapMessage) (string, error) {
 	req, err := http.NewRequestWithContext(context.Background(), "POST", client.url, strings.NewReader(request.String()))
 	if err != nil {
@@ -217,6 +279,7 @@ func (c *ClientNTLM) doPostEncrypted(client *Client, request *soap.SoapMessage) 
 	if err != nil {
 		// Session may have expired — reset so next call re-establishes
 		c.ntlmHTTPClient = nil
+		c.sessionReady = false
 		return "", fmt.Errorf("encrypted request failed: %w", err)
 	}
 	defer resp.Body.Close()
