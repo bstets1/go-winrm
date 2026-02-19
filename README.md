@@ -171,12 +171,15 @@ if err != nil {
 client.RunWithContext(ctx, "ipconfig /all", os.Stdout, os.Stderr)
 ```
 
-Domain users are supported via `DOMAIN\user` or `user@domain` formats:
+Domain users are supported via `DOMAIN\user` or `user@domain` formats. Local accounts can use the `.\user` prefix or just the bare username:
 
 ```go
 client, err := winrm.NewClientWithParameters(endpoint, `MYDOMAIN\admin`, "secret", params)
 // or
 client, err := winrm.NewClientWithParameters(endpoint, "admin@mydomain.com", "secret", params)
+// or (local account)
+client, err := winrm.NewClientWithParameters(endpoint, `.\Administrator`, "secret", params)
+client, err := winrm.NewClientWithParameters(endpoint, "Administrator", "secret", params)
 ```
 
 The `NewEncryption("ntlm")` API is also available for backwards compatibility:
@@ -390,3 +393,21 @@ format the code according to Go standards.
 
 When new dependencies are added to winrm you can use `make updatedeps` to
 get the latest and subsequently use `make` to compile.
+
+### Debug logging
+
+Set `WINRM_DEBUG=1` to enable verbose HTTP request/response logging and TCP
+connection tracking on the NTLM transport. Output goes to stderr.
+
+### Developer tools
+
+`cmd/winrm-smoketest` — end-to-end connectivity test driven by environment variables:
+
+```sh
+WINRM_HOST=192.168.1.10 WINRM_USER='.\Administrator' WINRM_PASS=secret \
+  WINRM_TRANSPORT=ntlm-encrypted go run ./cmd/winrm-smoketest
+```
+
+Supported transports: `ntlm-encrypted` (default), `ntlm`, `basic`. The command run defaults to `whoami` and can be overridden with `WINRM_COMMAND`.
+
+`cmd/ntlm-probe` — bare-metal diagnostic that tests bodgit and manual NTLM flows independently, useful for isolating protocol-level failures without the library in the way.
